@@ -22,11 +22,11 @@ import datetime
 import time
 import json
 
-NUM_BLOCKS = 10
+NUM_BLOCKS = 4
 
-POOL_TARGET = int('0fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 16)
+POOL_TARGET = int('ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', 16)
 
-DIFFICULTY = 10 # Set to positive integer for self-signing certificate mode
+DIFFICULTY = 0 # Set to positive integer for self-signing certificate mode
 
 KEYSIZE = 4096
 
@@ -42,8 +42,6 @@ base_block = {'payload': 'Genesis block'}
 #    exit("File permissions on keys/sign_key.pem must be 0600!")
 
 print(NODE_NAME)
-
-certificates_seen = {}
 
 
 def selfsigning(difficulty):
@@ -105,16 +103,27 @@ def mkcert():
     builder = builder.add_extension(x509.KeyUsage(digital_signature=True, content_commitment=True, key_encipherment = False, data_encipherment = False, key_agreement = False, key_cert_sign = False, crl_sign = False, encipher_only=False, decipher_only = False), critical = True)
     certificate = builder.sign(private_key = private_key, algorithm = hashes.SHA256(), backend = default_backend())
 
-    return private_key, certificate, certificate.fingerprint(hashes.SHA256()).hex()
+    return private_key, certificate
 
 
-def rts(difficulty):
+def rts(block, prev_block, difficulty):
+    global at
+    start = time.monotonic()
+    block['number'] = next_block_number()
+    block['difficulty'] = difficulty
+
+    if prev_block:
+        block['prev_blockhash'] = block_hash(prev_block).hex()
+    else:
+        block['prev_blockhash'] = '0'
+
     if selfsigning(difficulty):
         i=1
-
         while True:
-            pk, cert, cert_fp = mkcert()
-            if int(cert_fp, 16) <= calculate_difficulty_threshold(difficulty):
+            pk, cert = mkcert()
+            block['certificate'] = encode_cert(cert)
+            blockhash = block_hash(block)
+            if int(blockhash.hex(), 16) <= calculate_difficulty_threshold(difficulty):
                 break
             i+=1
 
@@ -123,9 +132,19 @@ def rts(difficulty):
         with open("keys/sign_key.pem", "rb") as key_file:
             pk = serialization.load_pem_private_key(key_file.read(),password=KEYPASS,backend=default_backend())
         cert = x509.load_pem_x509_certificate(open('keys/sign_cert.pem', 'rb').read(), default_backend())
-        cert_fp = cert.fingerprint(hashes.SHA256()).hex()
+        block['certificate'] = encode_cert(cert)
+        blockhash = block_hash(block)
 
-    return pk, cert, cert_fp
+    signature = pk.sign(blockhash, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+                        utils.Prehashed(hashes.SHA256()))
+
+    block['signature'] = signature.hex()
+
+    end = time.monotonic()
+
+    print(end - start)
+
+    return block
 
 
 def encode_cert(certificate):
@@ -153,7 +172,6 @@ def block_hash(block):
     digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
     digest.update(str(block['number']).encode('ascii', 'strict'))
     digest.update(str(block['difficulty']).encode('ascii', 'strict'))
-    digest.update(block['fingerprint'].encode('ascii', 'strict'))
     digest.update(block['certificate'].encode('ascii', 'strict'))
     digest.update(block['payload'].encode('ascii', 'strict'))
     digest.update(block['prev_blockhash'].encode('ascii', 'strict'))
@@ -182,49 +200,6 @@ def verify_block(prev_block, block):
     return True
 
 
-def iscertunique(certs_seen, block):
-    if block['fingerprint'] in certs_seen:
-        print('Duplicate certificate found.')
-        return False
-
-    certs_seen[block['fingerprint']] = True
-
-    print('Certificate unique.')
-
-    return True
-
-
-def make_block(block, prev_block, difficulty):
-    global at
-    start = time.monotonic()
-    block['number'] = next_block_number()
-    block['difficulty'] = difficulty
-
-    pk, cert, cert_fp = rts(difficulty)
-
-    block['fingerprint'] = cert_fp
-
-    block['certificate'] = encode_cert(cert)
-
-    if prev_block:
-        block['prev_blockhash'] = block_hash(prev_block).hex()
-        #print(block['prev_blockhash'])
-    else:
-        block['prev_blockhash'] = '0'
-
-    blockhash = block_hash(block)
-
-    signature = pk.sign(blockhash,padding.PSS(mgf = padding.MGF1(hashes.SHA256()),salt_length = padding.PSS.MAX_LENGTH),utils.Prehashed(hashes.SHA256()))
-
-    block['signature'] = signature.hex()
-
-    end = time.monotonic()
-
-    print (end - start)
-
-    return block
-
-
 def next_block_number():
     return time.monotonic()
 
@@ -239,15 +214,9 @@ def test_chain(num_blocks):
             prev_block = json.loads(blockchain[-1])
             base_block['payload'] = str(i)
 
-        next_block = make_block(base_block,prev_block,DIFFICULTY)
+        next_block = rts(base_block,prev_block,DIFFICULTY)
 
-        if selfsigning(DIFFICULTY):
-            if iscertunique(certificates_seen, next_block):
-                blockchain.append(json.dumps(next_block))
-            else:
-                print('Block rejected')
-        else:
-            blockchain.append(json.dumps(next_block))
+        blockchain.append(json.dumps(next_block))
 
     prev_block = None
 
